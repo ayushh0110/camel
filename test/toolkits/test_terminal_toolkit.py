@@ -11,24 +11,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ========= Copyright 2023-2026 @ CAMEL-AI.org. All Rights Reserved. =========
+import io
 import platform
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from camel.toolkits import TerminalToolkit
 from camel.toolkits.terminal_toolkit import DANGEROUS_COMMANDS
+from camel.toolkits.terminal_toolkit import (
+    terminal_toolkit as terminal_toolkit_module,
+)
 from camel.toolkits.terminal_toolkit.utils import sanitize_command
 
 
 @pytest.fixture
 def terminal_toolkit(temp_dir, request):
-    toolkit = TerminalToolkit(
-        working_directory=temp_dir,
-        safe_mode=False,
-        require_approval=None,
-    )
+    toolkit = TerminalToolkit(working_directory=temp_dir, safe_mode=False)
     # Ensure cleanup happens after test completes
     request.addfinalizer(toolkit.cleanup)
     return toolkit
@@ -48,8 +50,56 @@ def test_file(temp_dir):
     return file_path
 
 
+@pytest.fixture
+def docker_toolkit():
+    toolkit = object.__new__(TerminalToolkit)
+    toolkit.use_docker_backend = True
+    toolkit.container = SimpleNamespace(id="container-id")
+    toolkit.docker_api_client = Mock()
+    return toolkit
+
+
+def test_docker_exec_skips_inspect_when_exit_code_is_not_checked(
+    docker_toolkit,
+):
+    docker_toolkit.docker_api_client.exec_create.return_value = {
+        "Id": "exec-id"
+    }
+    docker_toolkit.docker_api_client.exec_start.return_value = b"output"
+
+    exit_code, output = docker_toolkit._docker_exec(
+        "mkdir -p /workspace", check_exit_code=False
+    )
+
+    assert exit_code is None
+    assert output == b"output"
+    docker_toolkit.docker_api_client.exec_inspect.assert_not_called()
+
+
+def test_docker_exec_api_error_does_not_expose_command(
+    docker_toolkit, monkeypatch
+):
+    class FakeAPIError(Exception):
+        pass
+
+    monkeypatch.setattr(terminal_toolkit_module, "APIError", FakeAPIError)
+    monkeypatch.setattr(terminal_toolkit_module, "NotFound", FakeAPIError)
+    docker_toolkit.docker_api_client.exec_create.side_effect = FakeAPIError(
+        "daemon unavailable"
+    )
+    secret = "ghp_SUPERSECRET"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        docker_toolkit._docker_exec(
+            f"pip install https://user:{secret}@example.com/private.git"
+        )
+
+    assert secret not in str(exc_info.value)
+    assert "daemon unavailable" in str(exc_info.value)
+
+
 def test_init():
-    toolkit = TerminalToolkit(require_approval=None)
+    toolkit = TerminalToolkit()
     try:
         assert toolkit.timeout == 20.0
         assert isinstance(toolkit.shell_sessions, dict)
@@ -71,10 +121,7 @@ def test_shell_exec(terminal_toolkit, temp_dir):
         "test_session",
         "nonexistent_command",
     )
-    assert (
-        "not found" in result.lower()
-        or "not recognized" in result.lower()
-    )
+    assert "not found" in result.lower()
 
     # Test session persistence - use non-blocking mode to create sessions
     session_id = "persistent_session"
@@ -109,11 +156,7 @@ def test_shell_exec_multiple_sessions(terminal_toolkit, temp_dir):
 
 def test_shell_write_content_to_file_basic(temp_dir, request):
     """Test basic file writing functionality."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=False,
-        require_approval=None,
-    )
+    toolkit = TerminalToolkit(working_directory=str(temp_dir), safe_mode=False)
     request.addfinalizer(toolkit.cleanup)
 
     test_content = "Hello, World!"
@@ -127,11 +170,7 @@ def test_shell_write_content_to_file_basic(temp_dir, request):
 
 def test_shell_write_content_to_file_with_subdirectory(temp_dir, request):
     """Test file writing with automatic parent directory creation."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=False,
-        require_approval=None,
-    )
+    toolkit = TerminalToolkit(working_directory=str(temp_dir), safe_mode=False)
     request.addfinalizer(toolkit.cleanup)
 
     test_content = "Nested content"
@@ -148,11 +187,7 @@ def test_shell_write_content_to_file_safe_mode_relative_path(
     temp_dir, request
 ):
     """Test safe mode with relative paths resolves correctly."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=True,
-        require_approval=None,
-    )
+    toolkit = TerminalToolkit(working_directory=str(temp_dir), safe_mode=True)
     request.addfinalizer(toolkit.cleanup)
 
     test_content = "Safe mode content"
@@ -169,11 +204,7 @@ def test_shell_write_content_to_file_safe_mode_blocks_path_traversal(
     temp_dir, request
 ):
     """Test that safe mode blocks path traversal attempts."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=True,
-        require_approval=None,
-    )
+    toolkit = TerminalToolkit(working_directory=str(temp_dir), safe_mode=True)
     request.addfinalizer(toolkit.cleanup)
 
     test_content = "Malicious content"
@@ -222,11 +253,7 @@ def test_sanitize_command_blocks_cd_expansion_outside_workdir(
 
 def test_shell_exec_cd_outside_returns_copy_guidance(temp_dir, request):
     """Shell exec should provide copy guidance for blocked cd traversal."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=True,
-        require_approval=None,
-    )
+    toolkit = TerminalToolkit(working_directory=str(temp_dir), safe_mode=True)
     request.addfinalizer(toolkit.cleanup)
 
     result = toolkit.shell_exec("test_session", "cd ../")
@@ -239,11 +266,7 @@ def test_shell_exec_cd_outside_returns_copy_guidance(temp_dir, request):
 
 def test_shell_exec_safe_mode_rejection_prefix(temp_dir, request):
     """Blocked command errors should clearly mention safe mode rejection."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=True,
-        require_approval=None,
-    )
+    toolkit = TerminalToolkit(working_directory=str(temp_dir), safe_mode=True)
     request.addfinalizer(toolkit.cleanup)
 
     result = toolkit.shell_exec("test_session", "rm -rf /")
@@ -398,94 +421,176 @@ def test_sanitize_command_respects_customized_dangerous_commands(
     assert "echo" in message.lower()
 
 
-def test_require_approval_blocks_when_callback_returns_false(
-    temp_dir, request
+@pytest.fixture
+def make_approval_toolkit(temp_dir, monkeypatch, request):
+    monkeypatch.setattr(
+        TerminalToolkit, "_setup_initial_environment", lambda self: None
+    )
+
+    def create(**kwargs):
+        toolkit = TerminalToolkit(working_directory=str(temp_dir), **kwargs)
+        request.addfinalizer(toolkit.cleanup)
+        return toolkit
+
+    return create
+
+
+@pytest.mark.parametrize("block", [True, False])
+@pytest.mark.parametrize("decision", [None, True, False, "error"])
+def test_shell_exec_approval(
+    make_approval_toolkit, monkeypatch, block, decision
 ):
-    """Approval callback returning False should block execution."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=False,
-        require_approval=lambda cmd: False,
-    )
-    request.addfinalizer(toolkit.cleanup)
-    result = toolkit.shell_exec("s1", "echo hello")
-    assert "rejected" in result.lower()
+    approval = None if decision is None else Mock(return_value=decision)
+    if decision == "error":
+        approval.side_effect = ValueError("policy failed")
+    toolkit = make_approval_toolkit(require_approval=approval)
+    popen = Mock(wraps=terminal_toolkit_module.subprocess.Popen)
+    monkeypatch.setattr(terminal_toolkit_module.subprocess, "Popen", popen)
+
+    if decision == "error":
+        with pytest.raises(ValueError, match="policy failed"):
+            toolkit.shell_exec("approval", "echo approved", block=block)
+    else:
+        result = toolkit.shell_exec("approval", "echo approved", block=block)
+        if decision is False:
+            assert "rejected" in result
+        elif block:
+            assert "approved" in result
+        else:
+            toolkit.shell_sessions["approval"]["process"].wait(timeout=5)
+
+    if approval is not None:
+        approval.assert_called_once_with("echo approved")
+    if decision is False or decision == "error":
+        popen.assert_not_called()
+        assert toolkit.shell_sessions == {}
+    else:
+        popen.assert_called_once()
 
 
-def test_require_approval_allows_when_callback_returns_true(
-    temp_dir, request
+@pytest.mark.parametrize("is_safe", [True, False])
+def test_approval_runs_after_sanitization(
+    make_approval_toolkit, monkeypatch, is_safe
 ):
-    """Approval callback returning True should allow execution."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=False,
-        require_approval=lambda cmd: True,
+    approval = Mock(return_value=False)
+    toolkit = make_approval_toolkit(require_approval=approval)
+    monkeypatch.setattr(
+        toolkit, "_sanitize_command", Mock(return_value=(is_safe, "sanitized"))
     )
-    request.addfinalizer(toolkit.cleanup)
-    result = toolkit.shell_exec("s1", "echo hello")
-    assert "hello" in result.lower()
+    toolkit.shell_exec("approval", "original")
+    if is_safe:
+        approval.assert_called_once_with("sanitized")
+    else:
+        approval.assert_not_called()
 
 
-def test_require_approval_none_disables_gate(temp_dir, request):
-    """require_approval=None should allow unrestricted execution."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=False,
-        require_approval=None,
-    )
-    request.addfinalizer(toolkit.cleanup)
-    result = toolkit.shell_exec("s1", "echo hello")
-    assert "hello" in result.lower()
-
-
-def test_require_approval_callback_receives_command(
-    temp_dir, request
+@pytest.mark.parametrize("backend", ["local", "docker"])
+@pytest.mark.parametrize("decision", [None, True, False, "error"])
+def test_process_input_approval(
+    make_approval_toolkit, monkeypatch, backend, decision
 ):
-    """The approval callback should receive the command string."""
-    received = []
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=False,
-        require_approval=lambda cmd: (
-            received.append(cmd) or True
-        ),
+    approval = None if decision is None else Mock(return_value=decision)
+    if decision == "error":
+        approval.side_effect = ValueError("policy failed")
+    toolkit = make_approval_toolkit(require_approval=approval)
+    process = Mock()
+    session = {
+        "running": True,
+        "backend": backend,
+        "process": process,
+        "command_history": [],
+        "log_file": "unused",
+    }
+    toolkit.shell_sessions["approval"] = session
+    monkeypatch.setattr(
+        toolkit, "_collect_output_until_idle", Mock(return_value="")
     )
-    request.addfinalizer(toolkit.cleanup)
-    toolkit.shell_exec("s1", "echo test_marker")
-    assert any("echo test_marker" in cmd for cmd in received)
+    monkeypatch.setattr(toolkit, "_write_to_log", Mock())
+    try:
+        if decision == "error":
+            with pytest.raises(ValueError, match="policy failed"):
+                toolkit.shell_write_to_process("approval", "echo input")
+        else:
+            result = toolkit.shell_write_to_process("approval", "echo input")
+            if decision is False:
+                assert "rejected" in result
+
+        if approval is not None:
+            approval.assert_called_once_with("echo input")
+        if decision is False or decision == "error":
+            process.stdin.write.assert_not_called()
+            process.stdin.flush.assert_not_called()
+            process._sock.sendall.assert_not_called()
+            assert session["command_history"] == []
+            assert session["running"] is True
+        elif backend == "local":
+            process.stdin.write.assert_called_once_with("echo input\n")
+            process.stdin.flush.assert_called_once()
+        else:
+            process._sock.sendall.assert_called_once_with(b"echo input\n")
+    finally:
+        toolkit.shell_sessions.clear()
 
 
-def test_require_approval_not_called_after_safe_mode_rejection(
-    temp_dir, request
+@pytest.mark.skipif(platform.system() == "Windows", reason="Requires bash")
+def test_approved_shell_does_not_approve_later_input(
+    make_approval_toolkit, temp_dir
 ):
-    """Approval callback should NOT fire for commands already
-    rejected by safe_mode."""
-    called = []
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=True,
-        require_approval=lambda cmd: (
-            called.append(cmd) or True
-        ),
-    )
-    request.addfinalizer(toolkit.cleanup)
-    result = toolkit.shell_exec("s1", "rm -rf /")
-    assert "error" in result.lower()
-    assert len(called) == 0
+    approval = Mock(side_effect=lambda command: command == "bash")
+    toolkit = make_approval_toolkit(require_approval=approval)
+    toolkit.shell_exec("approval", "bash", block=False)
+    process = toolkit.shell_sessions["approval"]["process"]
+    command = "echo bypass > approval_probe.txt"
+    try:
+        result = toolkit.shell_write_to_process("approval", command)
+        assert "rejected" in result
+        assert not (temp_dir / "approval_probe.txt").exists()
+        assert [call.args[0] for call in approval.call_args_list] == [
+            "bash",
+            command,
+        ]
+    finally:
+        process.stdin.write("exit\n")
+        process.stdin.flush()
+        try:
+            process.wait(timeout=5)
+        except terminal_toolkit_module.subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
-def test_require_approval_blocks_non_blocking_exec(
-    temp_dir, request
-):
-    """Approval gate should also fire for non-blocking
-    execution."""
-    toolkit = TerminalToolkit(
-        working_directory=str(temp_dir),
-        safe_mode=False,
-        require_approval=lambda cmd: False,
+@pytest.mark.parametrize("stdin", [None, io.StringIO("yes\n")])
+def test_console_approval_denies_non_tty(monkeypatch, stdin):
+    monkeypatch.setattr(terminal_toolkit_module.sys, "stdin", stdin)
+    prompt = Mock(side_effect=AssertionError("Must not read non-TTY input"))
+    monkeypatch.setattr("builtins.input", prompt)
+    assert (
+        terminal_toolkit_module._default_console_approval("echo test") is False
     )
-    request.addfinalizer(toolkit.cleanup)
-    result = toolkit.shell_exec(
-        "s1", "echo hello", block=False
+    prompt.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        ("yes", True),
+        (" Y ", True),
+        ("", False),
+        ("no", False),
+        (EOFError(), False),
+    ],
+)
+def test_console_approval_interactive(monkeypatch, response, expected):
+    monkeypatch.setattr(
+        terminal_toolkit_module.sys,
+        "stdin",
+        Mock(isatty=Mock(return_value=True)),
     )
-    assert "rejected" in result.lower()
+    prompt = Mock(return_value=response)
+    if isinstance(response, Exception):
+        prompt.side_effect = response
+    monkeypatch.setattr("builtins.input", prompt)
+    assert (
+        terminal_toolkit_module._default_console_approval("echo test")
+        is expected
+    )

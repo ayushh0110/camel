@@ -20,9 +20,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable
 from queue import Empty, Full, Queue
-from typing import Any
+from typing import Any, Callable, Dict, List, Optional
 
 from camel.logger import get_logger
 from camel.toolkits import manual_timeout
@@ -68,23 +67,20 @@ def _to_plain(text: str) -> str:
 
 
 def _default_console_approval(command: str) -> bool:
-    r"""Default approval callback that prompts via stdin.
-
-    In non-interactive environments (CI, headless), automatically
-    denies execution to prevent silent command runs.
+    r"""Ask for approval in a terminal; deny non-interactive input.
 
     Args:
-        command (str): The shell command requesting approval.
+        command (str): The command or process input requesting approval.
 
     Returns:
-        bool: True if the user approves, False otherwise.
+        bool: Whether the user explicitly approved the input.
     """
+    if sys.stdin is None or not sys.stdin.isatty():
+        return False
     try:
         response = input(
-            f"\n[TerminalToolkit] The following command "
-            f"is about to be executed:\n\n"
-            f"  {command}\n\n"
-            f"Do you approve? (y/N): ",
+            f"\n[TerminalToolkit] Approve command or process input:\n"
+            f"  {command}\nApprove? (y/N): "
         )
         return response.strip().lower() in ("y", "yes")
     except EOFError:
@@ -125,35 +121,31 @@ class TerminalToolkit(BaseToolkit):
             ``Runtime.GO`` and ``Runtime.JAVA``. If empty (the default),
             only the Python runtime is configured. Example:
             ``enable_other_runtimes=[Runtime.GO, Runtime.JAVA]``.
-        require_approval (Callable[[str], bool] | None, optional):
-            A callback invoked before executing any shell command.
-            It receives the command string (after safe_mode
-            sanitisation) and must return True to allow execution.
-            Defaults to an interactive stdin prompt. Pass None to
-            disable the gate and restore unrestricted execution.
-            Note: The default callback uses interactive stdin
-            input and will block in automated/agent pipelines.
-            For programmatic use, pass a custom callback or None.
-            If the callback raises, the exception propagates to
-            the caller.
-            (default: :obj:`_default_console_approval`)
+        require_approval (Optional[Callable[[str], bool]], optional): Callback
+            checked before starting a shell command or sending process input.
+            Receives the sanitized command for :obj:`shell_exec`, or the raw
+            input for :obj:`shell_write_to_process`. Return True to allow it;
+            exceptions propagate without executing the command or input.
+            None disables approval. Pass :obj:`_default_console_approval` for
+            interactive approval; non-interactive applications should provide
+            their own callback. This does not restrict actions performed
+            internally by an approved program or replace sandbox isolation.
+            (default: :obj:`None`)
     """
 
     def __init__(
         self,
-        timeout: float | None = 20.0,
-        working_directory: str | None = None,
+        timeout: Optional[float] = 20.0,
+        working_directory: Optional[str] = None,
         use_docker_backend: bool = False,
-        docker_container_name: str | None = None,
-        session_logs_dir: str | None = None,
+        docker_container_name: Optional[str] = None,
+        session_logs_dir: Optional[str] = None,
         safe_mode: bool = True,
-        allowed_commands: list[str] | None = None,
+        allowed_commands: Optional[List[str]] = None,
         clone_current_env: bool = False,
-        install_dependencies: list[str] | None = None,
+        install_dependencies: Optional[List[str]] = None,
         enable_other_runtimes: list[Runtime] | None = None,
-        require_approval: (
-            Callable[[str], bool] | None
-        ) = _default_console_approval,
+        require_approval: Optional[Callable[[str], bool]] = None,
     ):
         # auto-detect if running inside a CAMEL runtime container
         # when inside a runtime, use local execution (already sandboxed)
@@ -162,14 +154,14 @@ class TerminalToolkit(BaseToolkit):
         if self._in_runtime and use_docker_backend:
             logger.info(
                 "Detected CAMEL_RUNTIME environment - disabling Docker "
-                "backend since we're already inside a sandboxed container",
+                "backend since we're already inside a sandboxed container"
             )
             use_docker_backend = False
             docker_container_name = None
 
         self.use_docker_backend = use_docker_backend
         self.timeout = timeout
-        self.shell_sessions: dict[str, dict[str, Any]] = {}
+        self.shell_sessions: Dict[str, Dict[str, Any]] = {}
         # Thread-safe guard for concurrent access to
         # shell_sessions and session state
         self._session_lock = threading.RLock()
@@ -177,7 +169,7 @@ class TerminalToolkit(BaseToolkit):
         self._output_condition = threading.Condition(self._session_lock)
 
         # Initialize docker_workdir with proper type
-        self.docker_workdir: str | None = None
+        self.docker_workdir: Optional[str] = None
 
         if self.use_docker_backend:
             # For Docker backend, working_directory is path inside container
@@ -191,15 +183,16 @@ class TerminalToolkit(BaseToolkit):
                 self.working_dir = os.path.abspath(camel_workdir)
             else:
                 self.working_dir = os.path.abspath("./workspace")
-        # For local backend, working_directory is the local path
-        elif working_directory:
-            self.working_dir = os.path.abspath(working_directory)
         else:
-            camel_workdir = os.environ.get("CAMEL_WORKDIR")
-            if camel_workdir:
-                self.working_dir = os.path.abspath(camel_workdir)
+            # For local backend, working_directory is the local path
+            if working_directory:
+                self.working_dir = os.path.abspath(working_directory)
             else:
-                self.working_dir = os.path.abspath("./workspace")
+                camel_workdir = os.environ.get("CAMEL_WORKDIR")
+                if camel_workdir:
+                    self.working_dir = os.path.abspath(camel_workdir)
+                else:
+                    self.working_dir = os.path.abspath("./workspace")
 
         # Only create local directory for logs and local backend operations
         if not os.path.exists(self.working_dir):
@@ -214,22 +207,22 @@ class TerminalToolkit(BaseToolkit):
 
         # Environment management attributes
         self.clone_current_env = clone_current_env
-        self.cloned_env_path: str | None = None
-        self.initial_env_path: str | None = None
+        self.cloned_env_path: Optional[str] = None
+        self.initial_env_path: Optional[str] = None
         self.python_executable = sys.executable
         self.install_dependencies = install_dependencies or []
         self.enable_other_runtimes: set[Runtime] = set(
-            enable_other_runtimes or [],
+            enable_other_runtimes or []
         )
         # Instance-level env vars for runtimes (avoids mutating
         # process-global os.environ)
         self._runtime_env_vars: dict[str, str] = {}
 
         self.log_dir = os.path.abspath(
-            session_logs_dir or os.path.join(self.working_dir, "terminal_logs"),
+            session_logs_dir or os.path.join(self.working_dir, "terminal_logs")
         )
         self.blocking_log_file = os.path.join(
-            self.log_dir, "blocking_commands.log",
+            self.log_dir, "blocking_commands.log"
         )
         self.os_type = platform.system()
 
@@ -245,30 +238,30 @@ class TerminalToolkit(BaseToolkit):
                 raise ImportError(
                     "The 'docker' library is required to use the "
                     "Docker backend. Please install it with "
-                    "'pip install docker'.",
+                    "'pip install docker'."
                 )
             if not docker_container_name:
                 raise ValueError(
                     "docker_container_name must be "
-                    "provided when using Docker backend.",
+                    "provided when using Docker backend."
                 )
             try:
                 self.docker_api_client = docker.APIClient(
-                    base_url="unix://var/run/docker.sock",
+                    base_url='unix://var/run/docker.sock'
                 )
                 self.docker_client = docker.from_env()
                 try:
                     # Try to get existing container
                     self.container = self.docker_client.containers.get(
-                        docker_container_name,
+                        docker_container_name
                     )
                     logger.info(
                         f"Successfully attached to existing Docker container "
-                        f"'{docker_container_name}'.",
+                        f"'{docker_container_name}'."
                     )
                 except NotFound:
                     raise RuntimeError(
-                        f"Container '{docker_container_name}' not found.",
+                        f"Container '{docker_container_name}' not found."
                     )
 
                 # Ensure the working directory exists inside the container
@@ -276,14 +269,11 @@ class TerminalToolkit(BaseToolkit):
                     try:
                         quoted_dir = shlex.quote(self.docker_workdir)
                         mkdir_cmd = f'sh -lc "mkdir -p -- {quoted_dir}"'
-                        _init = self.docker_api_client.exec_create(
-                            self.container.id, mkdir_cmd,
-                        )
-                        self.docker_api_client.exec_start(_init["Id"])
+                        self._docker_exec(mkdir_cmd, check_exit_code=False)
                     except Exception as e:
                         logger.warning(
                             f"[Docker] Failed to ensure workdir "
-                            f"'{self.docker_workdir}': {e}",
+                            f"'{self.docker_workdir}': {e}"
                         )
             except APIError as e:
                 raise RuntimeError(f"Failed to connect to Docker daemon: {e}")
@@ -292,7 +282,7 @@ class TerminalToolkit(BaseToolkit):
         if self._in_runtime:
             logger.info(
                 "[ENV] Skipping environment setup - running inside "
-                "CAMEL runtime container",
+                "CAMEL runtime container"
             )
         elif not self.use_docker_backend:
             if self.clone_current_env:
@@ -303,7 +293,7 @@ class TerminalToolkit(BaseToolkit):
         elif self.clone_current_env:
             logger.info(
                 "[ENV CLONE] Skipping environment setup for Docker backend "
-                "- container is already isolated",
+                "- container is already isolated"
             )
 
         # Install dependencies
@@ -318,18 +308,18 @@ class TerminalToolkit(BaseToolkit):
             logger.info(f"[ENV CLONE] {msg.strip()}")
 
         success = clone_current_environment(
-            self.cloned_env_path, self.working_dir, update_callback,
+            self.cloned_env_path, self.working_dir, update_callback
         )
 
         if success:
             # Update python executable to use the cloned environment
-            if self.os_type == "Windows":
+            if self.os_type == 'Windows':
                 self.python_executable = os.path.join(
-                    self.cloned_env_path, "Scripts", "python.exe",
+                    self.cloned_env_path, "Scripts", "python.exe"
                 )
             else:
                 self.python_executable = os.path.join(
-                    self.cloned_env_path, "bin", "python",
+                    self.cloned_env_path, "bin", "python"
                 )
 
             # Set up other language runtimes if requested
@@ -337,7 +327,7 @@ class TerminalToolkit(BaseToolkit):
         else:
             logger.info(
                 "[ENV CLONE] Failed to create cloned environment, "
-                "using system Python",
+                "using system Python"
             )
 
     def _install_dependencies(self):
@@ -354,32 +344,23 @@ class TerminalToolkit(BaseToolkit):
             install_cmd = f'sh -lc "pip install {pkg_str}"'
 
             try:
-                exec_id = self.docker_api_client.exec_create(
-                    self.container.id, install_cmd,
-                )["Id"]
-                log = self.docker_api_client.exec_start(exec_id)
-                logger.info(f"Package installation output:\n{log}")
-
-                # Check exit code to ensure installation succeeded
-                exec_info = self.docker_api_client.exec_inspect(exec_id)
-                if exec_info["ExitCode"] != 0:
-                    error_msg = (
-                        f"Failed to install dependencies in Docker: "
-                        f"{log.decode('utf-8', errors='ignore')}"
-                    )
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-
-                logger.info(
-                    "Successfully installed all dependencies in Docker.",
+                exit_code, output = self._docker_exec(
+                    install_cmd, check_exit_code=True
                 )
-            except Exception as e:
-                if not isinstance(e, RuntimeError):
-                    logger.error(f"Docker dependency installation error: {e}")
-                    raise RuntimeError(
-                        f"Docker dependency installation error: {e}",
-                    ) from e
+                logger.info(
+                    "Package installation output:\n%s",
+                    output.decode("utf-8", errors="ignore"),
+                )
+                logger.info(
+                    "Successfully installed all dependencies in Docker."
+                )
+            except RuntimeError:
                 raise
+            except Exception as e:
+                logger.error(f"Docker dependency installation error: {e}")
+                raise RuntimeError(
+                    f"Docker dependency installation error: {e}"
+                ) from e
 
         else:
             pip_cmd = [
@@ -404,14 +385,14 @@ class TerminalToolkit(BaseToolkit):
             except subprocess.CalledProcessError as e:
                 logger.error(f"Failed to install dependencies: {e.stderr}")
                 raise RuntimeError(
-                    f"Failed to install dependencies: {e.stderr}",
+                    f"Failed to install dependencies: {e.stderr}"
                 ) from e
             except subprocess.TimeoutExpired:
                 logger.error(
-                    "Dependency installation timed out after 5 minutes",
+                    "Dependency installation timed out after 5 minutes"
                 )
                 raise RuntimeError(
-                    "Dependency installation timed out after 5 minutes",
+                    "Dependency installation timed out after 5 minutes"
                 )
 
     def _setup_initial_environment(self):
@@ -433,21 +414,21 @@ class TerminalToolkit(BaseToolkit):
             )
         else:
             update_callback(
-                "Falling back to standard venv for environment setup\n",
+                "Falling back to standard venv for environment setup\n"
             )
             success = setup_initial_env_with_venv(
-                self.initial_env_path, self.working_dir, update_callback,
+                self.initial_env_path, self.working_dir, update_callback
             )
 
         if success:
             # Update python executable to use the initial environment
-            if self.os_type == "Windows":
+            if self.os_type == 'Windows':
                 self.python_executable = os.path.join(
-                    self.initial_env_path, "Scripts", "python.exe",
+                    self.initial_env_path, "Scripts", "python.exe"
                 )
             else:
                 self.python_executable = os.path.join(
-                    self.initial_env_path, "bin", "python",
+                    self.initial_env_path, "bin", "python"
                 )
 
             # Check Node.js availability
@@ -458,7 +439,7 @@ class TerminalToolkit(BaseToolkit):
         else:
             logger.info(
                 "[ENV INIT] Failed to create initial environment, "
-                "using system Python",
+                "using system Python"
             )
 
     def _setup_optional_runtimes(self, update_callback):
@@ -476,7 +457,7 @@ class TerminalToolkit(BaseToolkit):
             go_path = ensure_go_available(update_callback)
             if go_path:
                 current = self._runtime_env_vars.get(
-                    "PATH", os.environ.get("PATH", ""),
+                    "PATH", os.environ.get("PATH", "")
                 )
                 self._runtime_env_vars["PATH"] = go_path + os.pathsep + current
 
@@ -487,7 +468,7 @@ class TerminalToolkit(BaseToolkit):
                 self._runtime_env_vars["JAVA_HOME"] = java_home
                 java_bin = os.path.join(java_home, "bin")
                 current = self._runtime_env_vars.get(
-                    "PATH", os.environ.get("PATH", ""),
+                    "PATH", os.environ.get("PATH", "")
                 )
                 self._runtime_env_vars["PATH"] = (
                     java_bin + os.pathsep + current
@@ -507,11 +488,11 @@ class TerminalToolkit(BaseToolkit):
         env["PYTHONUNBUFFERED"] = "1"
         return env
 
-    def _get_venv_path(self) -> str | None:
+    def _get_venv_path(self) -> Optional[str]:
         r"""Get the virtual environment path if available."""
         if self.cloned_env_path and os.path.exists(self.cloned_env_path):
             return self.cloned_env_path
-        if self.initial_env_path and os.path.exists(self.initial_env_path):
+        elif self.initial_env_path and os.path.exists(self.initial_env_path):
             return self.initial_env_path
         return None
 
@@ -526,10 +507,71 @@ class TerminalToolkit(BaseToolkit):
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(_to_plain(content) + "\n")
 
+    def _docker_exec(
+        self,
+        command: str,
+        *,
+        check_exit_code: bool = True,
+    ) -> tuple[Optional[int], bytes]:
+        r"""Execute a command in the Docker container and return the result.
+
+        Consolidates the repeated ``exec_create → exec_start → exec_inspect``
+        pattern into a single helper, reducing code duplication and improving
+        error handling consistency.
+
+        Args:
+            command: The shell command to execute inside the container.
+            check_exit_code: If True, raises RuntimeError on non-zero exit.
+
+        Returns:
+            A tuple of (exit_code, output_bytes). The exit code is ``None``
+            when ``check_exit_code`` is False.
+
+        Raises:
+            RuntimeError: If the Docker API call fails or the command exits
+                          with a non-zero code and ``check_exit_code`` is True.
+        """
+        if not self.use_docker_backend:
+            raise RuntimeError(
+                "_docker_exec called but Docker backend is not enabled."
+            )
+        try:
+            exec_id = self.docker_api_client.exec_create(
+                self.container.id, cmd=command
+            )["Id"]
+            output = self.docker_api_client.exec_start(exec_id)
+            exit_code = None
+            if check_exit_code:
+                exec_info = self.docker_api_client.exec_inspect(exec_id)
+                exit_code = exec_info["ExitCode"]
+            if check_exit_code and exit_code != 0:
+                error_text = (
+                    output.decode("utf-8", errors="ignore")
+                    if isinstance(output, bytes)
+                    else str(output)
+                )
+                logger.error(
+                    "Docker command failed with exit code %s. Output:\n%s",
+                    exit_code,
+                    error_text,
+                )
+                raise RuntimeError(
+                    f"Docker command exited with code {exit_code}: "
+                    f"{error_text}"
+                )
+            return exit_code, output
+        except (APIError, NotFound) as e:
+            raise RuntimeError(f"Docker API error: {e}") from e
+
+    def _approve_command(self, command: str) -> bool:
+        r"""Check approval for a command or process input."""
+        return self._require_approval is None or self._require_approval(
+            command
+        )
+
     def _sanitize_command(self, command: str) -> tuple[bool, str]:
         r"""A comprehensive command sanitizer for both local and
-        Docker backends.
-        """
+        Docker backends."""
         return sanitize_command(
             command=command,
             use_docker_backend=self.use_docker_backend,
@@ -553,7 +595,7 @@ class TerminalToolkit(BaseToolkit):
                     # Data is still written to log file, so not lost
                     logger.warning(
                         f"[SESSION {session_id}] Output queue full, "
-                        f"dropping data (still logged to file)",
+                        f"dropping data (still logged to file)"
                     )
                     return
                 # Notify waiters that new output is available
@@ -567,7 +609,7 @@ class TerminalToolkit(BaseToolkit):
                     # For local processes, read line by line from stdout
                     try:
                         for line in iter(
-                            session["process"].stdout.readline, "",
+                            session["process"].stdout.readline, ''
                         ):
                             self._write_to_log(session["log_file"], line)
                             safe_put(line)
@@ -590,16 +632,16 @@ class TerminalToolkit(BaseToolkit):
                             if not data:
                                 break
                             decoded_data = data.decode(
-                                "utf-8", errors="ignore",
+                                'utf-8', errors='ignore'
                             )
                             self._write_to_log(
-                                session["log_file"], decoded_data,
+                                session["log_file"], decoded_data
                             )
                             safe_put(decoded_data)
                         # Check if the process is still running
                         if not self.docker_api_client.exec_inspect(
-                            session["exec_id"],
-                        )["Running"]:
+                            session["exec_id"]
+                        )['Running']:
                             break
             except Exception as e:
                 # Log the exception for diagnosis and store it on the session
@@ -611,7 +653,7 @@ class TerminalToolkit(BaseToolkit):
                 except Exception as cleanup_error:
                     logger.warning(
                         f"[SESSION {session_id}] Failed to store error state: "
-                        f"{cleanup_error}",
+                        f"{cleanup_error}"
                     )
             finally:
                 try:
@@ -650,7 +692,7 @@ class TerminalToolkit(BaseToolkit):
             if id not in self.shell_sessions:
                 return f"Error: No session found with ID '{id}'."
 
-        output_parts: list[str] = []
+        output_parts: List[str] = []
         last_output_time = time.time()
         start_time = last_output_time
 
@@ -665,7 +707,7 @@ class TerminalToolkit(BaseToolkit):
             if "--- SESSION TERMINATED ---" in new_output:
                 # Append the final output before the termination message
                 final_part = new_output.replace(
-                    "--- SESSION TERMINATED ---", "",
+                    "--- SESSION TERMINATED ---", ""
                 ).strip()
                 if final_part:
                     output_parts.append(final_part)
@@ -759,23 +801,21 @@ class TerminalToolkit(BaseToolkit):
                 )
             command = message
 
-        if self._require_approval and not self._require_approval(
-            command,
-        ):
+        if not self._approve_command(command):
             return "Command rejected by approval policy."
 
         if self.use_docker_backend:
             # For Docker, we always run commands in a shell
             # to support complex commands.
             # Use shlex.quote to properly escape the command string.
-            command = f"bash -c {shlex.quote(command)}"
+            command = f'bash -c {shlex.quote(command)}'
         else:
             # For local execution, activate virtual environment if available
             env_path = self._get_venv_path()
             if env_path:
-                if self.os_type == "Windows":
+                if self.os_type == 'Windows':
                     activate = os.path.join(
-                        env_path, "Scripts", "activate.bat",
+                        env_path, "Scripts", "activate.bat"
                     )
                     command = f'call "{activate}" && {command}'
                 else:
@@ -820,7 +860,7 @@ class TerminalToolkit(BaseToolkit):
                             partial_output = ""
 
                         session_log_file = os.path.join(
-                            self.log_dir, f"session_{session_id}.log",
+                            self.log_dir, f"session_{session_id}.log"
                         )
                         self._write_to_log(
                             session_log_file,
@@ -849,7 +889,7 @@ class TerminalToolkit(BaseToolkit):
                         self._start_output_reader_thread(session_id)
 
                         self._write_to_log(
-                            self.blocking_log_file, log_entry + "\n",
+                            self.blocking_log_file, log_entry + "\n"
                         )
                         return (
                             f"Command did not complete within {timeout} "
@@ -866,20 +906,20 @@ class TerminalToolkit(BaseToolkit):
                         self.docker_workdir is not None
                     )  # Docker backend always has workdir
                     exec_instance = self.docker_api_client.exec_create(
-                        self.container.id, command, workdir=self.docker_workdir,
+                        self.container.id, command, workdir=self.docker_workdir
                     )
-                    exec_id = exec_instance["Id"]
+                    exec_id = exec_instance['Id']
 
                     # Use thread to implement timeout for docker exec
-                    result_container: dict[str, Any] = {}
+                    result_container: Dict[str, Any] = {}
 
                     def run_exec():
                         try:
-                            result_container["output"] = (
+                            result_container['output'] = (
                                 self.docker_api_client.exec_start(exec_id)
                             )
                         except Exception as e:
-                            result_container["error"] = e
+                            result_container['error'] = e
 
                     exec_thread = threading.Thread(target=run_exec)
                     exec_thread.start()
@@ -891,7 +931,7 @@ class TerminalToolkit(BaseToolkit):
                         # The exec_thread continues running in background and
                         # will eventually write output to result_container.
                         session_log_file = os.path.join(
-                            self.log_dir, f"session_{session_id}.log",
+                            self.log_dir, f"session_{session_id}.log"
                         )
                         self._write_to_log(
                             session_log_file,
@@ -915,7 +955,7 @@ class TerminalToolkit(BaseToolkit):
                             }
 
                         self._write_to_log(
-                            self.blocking_log_file, log_entry + "\n",
+                            self.blocking_log_file, log_entry + "\n"
                         )
                         return (
                             f"Command did not complete within {timeout} "
@@ -927,17 +967,18 @@ class TerminalToolkit(BaseToolkit):
                             f"terminate"
                         )
 
-                    if "error" in result_container:
-                        raise result_container["error"]
+                    if 'error' in result_container:
+                        raise result_container['error']
 
-                    output = result_container["output"].decode(
-                        "utf-8", errors="ignore",
+                    output = result_container['output'].decode(
+                        'utf-8', errors='ignore'
                     )
 
                 log_entry += f"--- Output ---\n{output}\n"
                 if output.strip():
                     return _to_plain(output)
-                return "Command executed successfully (no output)."
+                else:
+                    return "Command executed successfully (no output)."
             except Exception as e:
                 error_msg = f"Error executing command: {e}"
                 log_entry += f"--- Error ---\n{error_msg}\n"
@@ -947,7 +988,7 @@ class TerminalToolkit(BaseToolkit):
         else:
             # --- NON-BLOCKING EXECUTION ---
             session_log_file = os.path.join(
-                self.log_dir, f"session_{session_id}.log",
+                self.log_dir, f"session_{session_id}.log"
             )
 
             # PYTHONUNBUFFERED=1 for real-time output
@@ -1018,9 +1059,9 @@ class TerminalToolkit(BaseToolkit):
                         workdir=self.docker_workdir,
                         environment=docker_env,
                     )
-                    exec_id = exec_instance["Id"]
+                    exec_id = exec_instance['Id']
                     exec_socket = self.docker_api_client.exec_start(
-                        exec_id, tty=True, stream=True, socket=True,
+                        exec_id, tty=True, stream=True, socket=True
                     )
                     with self._session_lock:
                         self.shell_sessions[session_id]["process"] = (
@@ -1058,7 +1099,7 @@ class TerminalToolkit(BaseToolkit):
                         self.shell_sessions[session_id]["running"] = False
                 error_msg = f"Error starting non-blocking command: {e}"
                 self._write_to_log(
-                    session_log_file, f"--- Error ---\n{error_msg}\n",
+                    session_log_file, f"--- Error ---\n{error_msg}\n"
                 )
                 return error_msg
 
@@ -1086,6 +1127,9 @@ class TerminalToolkit(BaseToolkit):
                 )
             session = self.shell_sessions[id]
 
+        if not self._approve_command(command):
+            return "Input rejected by approval policy."
+
         # Flush any lingering output from previous commands.
         self._collect_output_until_idle(id, idle_duration=0.3, max_wait=2.0)
 
@@ -1100,20 +1144,21 @@ class TerminalToolkit(BaseToolkit):
 
         try:
             if backend == "local":
-                process.stdin.write(command + "\n")
+                process.stdin.write(command + '\n')
                 process.stdin.flush()
             else:  # docker
                 socket = process._sock
-                socket.sendall((command + "\n").encode("utf-8"))
+                socket.sendall((command + '\n').encode('utf-8'))
 
             # Wait for and collect the new output
             output = self._collect_output_until_idle(id)
 
             if output.strip():
                 return output
-            return (
-                f"Input sent to session '{id}' successfully (no output)."
-            )
+            else:
+                return (
+                    f"Input sent to session '{id}' successfully (no output)."
+                )
 
         except Exception as e:
             return f"Error writing to session '{id}': {e}"
@@ -1147,7 +1192,8 @@ class TerminalToolkit(BaseToolkit):
 
             if final_output:
                 return "".join(final_output) + "\n\n--- SESSION TERMINATED ---"
-            return "--- SESSION TERMINATED (no new output) ---"
+            else:
+                return "--- SESSION TERMINATED (no new output) ---"
 
         # For running session, check for new output
         output = []
@@ -1159,56 +1205,59 @@ class TerminalToolkit(BaseToolkit):
 
         if output:
             return "".join(output)
-        # For timeout-converted Docker sessions, check thread and output
-        if (
-            session.get("timeout_converted")
-            and session.get("backend") == "docker"
-        ):
-            exec_thread = session.get("exec_thread")
-            result_container = session.get("result_container", {})
+        else:
+            # For timeout-converted Docker sessions, check thread and output
+            if (
+                session.get("timeout_converted")
+                and session.get("backend") == "docker"
+            ):
+                exec_thread = session.get("exec_thread")
+                result_container = session.get("result_container", {})
 
-            # Check if the background thread has completed
-            if exec_thread and not exec_thread.is_alive():
-                # Thread finished - get output from result_container
-                with self._session_lock:
-                    if id in self.shell_sessions:
-                        self.shell_sessions[id]["running"] = False
+                # Check if the background thread has completed
+                if exec_thread and not exec_thread.is_alive():
+                    # Thread finished - get output from result_container
+                    with self._session_lock:
+                        if id in self.shell_sessions:
+                            self.shell_sessions[id]["running"] = False
 
-                if "output" in result_container:
-                    completed_output = result_container["output"].decode(
-                        "utf-8", errors="ignore",
-                    )
-                    # Write to log file
-                    self._write_to_log(
-                        session["log_file"], completed_output,
-                    )
+                    if 'output' in result_container:
+                        completed_output = result_container['output'].decode(
+                            'utf-8', errors='ignore'
+                        )
+                        # Write to log file
+                        self._write_to_log(
+                            session["log_file"], completed_output
+                        )
+                        return (
+                            f"{_to_plain(completed_output)}\n\n"
+                            f"--- SESSION COMPLETED ---"
+                        )
+                    elif 'error' in result_container:
+                        return (
+                            f"--- SESSION FAILED ---\n"
+                            f"Error: {result_container['error']}"
+                        )
+                    else:
+                        return "--- SESSION COMPLETED (no output) ---"
+                else:
+                    # Thread still running
                     return (
-                        f"{_to_plain(completed_output)}\n\n"
-                        f"--- SESSION COMPLETED ---"
+                        "[Process still running]\n"
+                        "Command is executing in background. "
+                        "Check again later for output.\n"
+                        "Use shell_kill_process() to terminate if needed."
                     )
-                if "error" in result_container:
-                    return (
-                        f"--- SESSION FAILED ---\n"
-                        f"Error: {result_container['error']}"
-                    )
-                return "--- SESSION COMPLETED (no output) ---"
-            # Thread still running
+
+            # No new output - guide the agent
             return (
-                "[Process still running]\n"
-                "Command is executing in background. "
-                "Check again later for output.\n"
-                "Use shell_kill_process() to terminate if needed."
+                "[No new output]\n"
+                "Session is running but idle. Actions could take:\n"
+                "  - For interactive sessions: Send input "
+                "with shell_write_to_process()\n"
+                "  - For long tasks: Check again later (don't poll "
+                "too frequently)"
             )
-
-        # No new output - guide the agent
-        return (
-            "[No new output]\n"
-            "Session is running but idle. Actions could take:\n"
-            "  - For interactive sessions: Send input "
-            "with shell_write_to_process()\n"
-            "  - For long tasks: Check again later (don't poll "
-            "too frequently)"
-        )
 
     @manual_timeout
     def shell_kill_process(self, id: str) -> str:
@@ -1244,30 +1293,28 @@ class TerminalToolkit(BaseToolkit):
                         session["process"].stdout.close()
                 except Exception:
                     pass
-            # Check if this is a timeout-converted session (no socket)
-            elif session.get("timeout_converted") and session.get("exec_id"):
-                # Kill the process using Docker exec PID
-                exec_id = session["exec_id"]
-                try:
-                    exec_info = self.docker_api_client.exec_inspect(
-                        exec_id,
-                    )
-                    pid = exec_info.get("Pid")
-                    if pid and exec_info.get("Running", False):
-                        # Kill the process inside the container
-                        kill_cmd = f"kill -9 {pid}"
-                        kill_exec = self.docker_api_client.exec_create(
-                            self.container.id, kill_cmd,
+            else:  # docker
+                # Check if this is a timeout-converted session (no socket)
+                if session.get("timeout_converted") and session.get("exec_id"):
+                    # Kill the process using Docker exec PID
+                    exec_id = session["exec_id"]
+                    try:
+                        exec_info = self.docker_api_client.exec_inspect(
+                            exec_id
                         )
-                        self.docker_api_client.exec_start(kill_exec["Id"])
-                except Exception as kill_err:
-                    logger.warning(
-                        f"[SESSION {id}] Failed to kill Docker exec "
-                        f"process: {kill_err}",
-                    )
-            elif session["process"] is not None:
-                # Normal non-blocking session with socket
-                session["process"].close()
+                        pid = exec_info.get('Pid')
+                        if pid and exec_info.get('Running', False):
+                            # Kill the process inside the container
+                            kill_cmd = f'kill -9 {pid}'
+                            self._docker_exec(kill_cmd, check_exit_code=False)
+                    except Exception as kill_err:
+                        logger.warning(
+                            f"[SESSION {id}] Failed to kill Docker exec "
+                            f"process: {kill_err}"
+                        )
+                elif session["process"] is not None:
+                    # Normal non-blocking session with socket
+                    session["process"].close()
             with self._session_lock:
                 if id in self.shell_sessions:
                     self.shell_sessions[id]["running"] = False
@@ -1306,12 +1353,13 @@ class TerminalToolkit(BaseToolkit):
                 user_input = input("Your response: ").strip()
                 if not user_input:
                     return "No user response."
-                print(f"Creating session '{id}' and executing command...")
-                result = self.shell_exec(id, user_input, block=True)
-                return (
-                    f"Session '{id}' created and "
-                    f"executed command:\n{result}"
-                )
+                else:
+                    print(f"Creating session '{id}' and executing command...")
+                    result = self.shell_exec(id, user_input, block=True)
+                    return (
+                        f"Session '{id}' created and "
+                        f"executed command:\n{result}"
+                    )
             except EOFError:
                 return f"User input interrupted for session '{id}' creation."
 
@@ -1333,8 +1381,9 @@ class TerminalToolkit(BaseToolkit):
                 user_input = input("Your input: ").strip()
                 if not user_input:
                     return f"User provided no input for session '{id}'."
-                # Send input to the existing session
-                return self.shell_write_to_process(id, user_input)
+                else:
+                    # Send input to the existing session
+                    return self.shell_write_to_process(id, user_input)
             except EOFError:
                 return f"User input interrupted for session '{id}'."
 
@@ -1353,7 +1402,7 @@ class TerminalToolkit(BaseToolkit):
         if not self.use_docker_backend and self.working_dir:
             if not os.path.isabs(file_path):
                 file_path = os.path.normpath(
-                    os.path.join(self.working_dir, file_path),
+                    os.path.join(self.working_dir, file_path)
                 )
             else:
                 file_path = os.path.normpath(file_path)
@@ -1362,12 +1411,12 @@ class TerminalToolkit(BaseToolkit):
             # Safe mode path containment check for local backend
             if self.safe_mode:
                 working_dir_normalized = os.path.normpath(
-                    os.path.abspath(self.working_dir),
+                    os.path.abspath(self.working_dir)
                 )
                 # Use os.path.commonpath for secure path containment check
                 try:
                     common = os.path.commonpath(
-                        [file_path, working_dir_normalized],
+                        [file_path, working_dir_normalized]
                     )
                     if common != working_dir_normalized:
                         return (
@@ -1393,10 +1442,7 @@ class TerminalToolkit(BaseToolkit):
                 if parent_dir:
                     quoted_dir = shlex.quote(parent_dir)
                     mkdir_cmd = f'sh -lc "mkdir -p {quoted_dir}"'
-                    mkdir_exec = self.docker_api_client.exec_create(
-                        self.container.id, mkdir_cmd,
-                    )
-                    self.docker_api_client.exec_start(mkdir_exec["Id"])
+                    self._docker_exec(mkdir_cmd, check_exit_code=False)
 
                 # Write content to a temporary file on the host inside log_dir
                 temp_file_name = f"temp_{uuid.uuid4().hex}.txt"
@@ -1409,7 +1455,7 @@ class TerminalToolkit(BaseToolkit):
                     f"{self.container.name}:{dest_path_in_container}"
                 )
                 subprocess.run(
-                    ["docker", "cp", temp_host_path, container_dest],
+                    ['docker', 'cp', temp_host_path, container_dest],
                     check=True,
                     capture_output=True,
                     text=True,
@@ -1483,7 +1529,7 @@ class TerminalToolkit(BaseToolkit):
         for session_id in session_ids:
             with self._session_lock:
                 is_running = self.shell_sessions.get(session_id, {}).get(
-                    "running", False,
+                    "running", False
                 )
             if is_running:
                 try:
@@ -1491,7 +1537,7 @@ class TerminalToolkit(BaseToolkit):
                 except Exception as e:
                     logger.warning(
                         f"Failed to kill session '{session_id}' "
-                        f"during cleanup: {e}",
+                        f"during cleanup: {e}"
                     )
 
     @manual_timeout
@@ -1502,7 +1548,7 @@ class TerminalToolkit(BaseToolkit):
         except Exception:
             pass
 
-    def get_tools(self) -> list[FunctionTool]:
+    def get_tools(self) -> List[FunctionTool]:
         r"""Returns a list of FunctionTool objects representing the functions
         in the toolkit.
 

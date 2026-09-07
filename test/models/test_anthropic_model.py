@@ -34,6 +34,27 @@ class TravelResponse(BaseModel):
     city: str
 
 
+def _make_strict_openai_tool(
+    name: str,
+    properties=None,
+    required=None,
+):
+    properties = properties or {}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "Test tool",
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required or [],
+            },
+            "strict": True,
+        },
+    }
+
+
 @pytest.mark.model_backend
 @pytest.mark.parametrize(
     "model_type",
@@ -540,6 +561,8 @@ def test_convert_anthropic_response_stop_reasons():
         "max_tokens": "length",
         "stop_sequence": "stop",
         "tool_use": "tool_calls",
+        # A safety refusal must map to the OpenAI vocabulary, not leak raw.
+        "refusal": "content_filter",
     }
 
     for anthropic_reason, openai_reason in stop_reason_mapping.items():
@@ -632,6 +655,80 @@ def test_convert_tools_preserves_strict_flag():
 
     result = model._convert_openai_tools_to_anthropic(openai_tools)
 
+    assert result[0]["strict"] is False
+
+
+def test_convert_tools_preserves_strict_within_anthropic_limits():
+    """Strict mode remains enabled when the request is within limits."""
+    model = AnthropicModel(
+        "claude-sonnet-5",
+        api_key="dummy_api_key",
+    )
+    openai_tools = [
+        _make_strict_openai_tool(f"tool_{index}") for index in range(20)
+    ]
+
+    result = model._convert_openai_tools_to_anthropic(openai_tools)
+
+    assert result is not None
+    assert all(tool["strict"] is True for tool in result)
+
+
+def test_convert_tools_disables_strict_above_anthropic_tool_limit(caplog):
+    """All tools remain available when strict tool count exceeds 20."""
+    model = AnthropicModel(
+        "claude-sonnet-5",
+        api_key="dummy_api_key",
+    )
+    openai_tools = [
+        _make_strict_openai_tool(f"tool_{index}") for index in range(21)
+    ]
+
+    result = model._convert_openai_tools_to_anthropic(openai_tools)
+
+    assert result is not None
+    assert len(result) == 21
+    assert all(tool["strict"] is False for tool in result)
+    assert all(tool["function"]["strict"] is True for tool in openai_tools)
+    assert "21 strict tools (maximum 20)" in caplog.text
+
+
+def test_convert_tools_disables_strict_above_anthropic_union_limit():
+    """Union-heavy schemas fall back to non-strict tool use."""
+    model = AnthropicModel(
+        ModelType.CLAUDE_FABLE_5,
+        api_key="dummy_api_key",
+    )
+    properties = {
+        f"value_{index}": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        for index in range(17)
+    }
+    openai_tools = [
+        _make_strict_openai_tool(
+            "union_heavy_tool", properties, list(properties)
+        )
+    ]
+
+    result = model._convert_openai_tools_to_anthropic(openai_tools)
+
+    assert result is not None
+    assert result[0]["strict"] is False
+
+
+def test_convert_tools_disables_strict_above_anthropic_optional_limit():
+    """Schemas with too many optional parameters use non-strict tools."""
+    model = AnthropicModel(
+        ModelType.CLAUDE_FABLE_5,
+        api_key="dummy_api_key",
+    )
+    properties = {f"value_{index}": {"type": "string"} for index in range(25)}
+    openai_tools = [
+        _make_strict_openai_tool("optional_heavy_tool", properties)
+    ]
+
+    result = model._convert_openai_tools_to_anthropic(openai_tools)
+
+    assert result is not None
     assert result[0]["strict"] is False
 
 
@@ -898,6 +995,31 @@ def test_convert_stream_chunk_message_delta_stop():
     )
 
     assert result.choices[0].finish_reason == "stop"
+
+
+def test_convert_stream_chunk_message_delta_refusal():
+    """A streaming safety refusal must surface as content_filter.
+
+    Without the mapping the message_delta chunk carries finish_reason=None
+    and message_stop coerces it to "stop", so the refusal reads as a normal
+    completion.
+    """
+    model = AnthropicModel(
+        ModelType.CLAUDE_HAIKU_4_5,
+        api_key="dummy_api_key",
+    )
+
+    mock_chunk = MagicMock()
+    mock_chunk.type = "message_delta"
+    mock_chunk.delta = MagicMock()
+    mock_chunk.delta.stop_reason = "refusal"
+
+    tool_call_index = {}
+    result = model._convert_anthropic_stream_to_openai_chunk(
+        mock_chunk, "claude-haiku-4-5", tool_call_index
+    )
+
+    assert result.choices[0].finish_reason == "content_filter"
 
 
 def test_convert_stream_chunk_message_stop():
